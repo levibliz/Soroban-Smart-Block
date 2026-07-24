@@ -13,6 +13,11 @@ const DUMMY_SOURCE = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
 
 const rpc = new SorobanRpc.Server(RPC_URL, { allowHttp: true });
 
+// In-memory cache: contractId → { decimals, symbol, name }
+// Ensures the RPC call for decimals is only made once per contract across
+// multiple events, satisfying the acceptance criteria for #568.
+const _metadataCache = new Map();
+
 /**
  * Simulate a no-arg contract call and return the native ScVal result.
  */
@@ -37,19 +42,45 @@ async function simulateCall(contractId, method) {
 
 /**
  * Fetch SEP-41 token metadata for a given contract ID.
+ * Results are cached in memory so subsequent calls for the same contract
+ * return instantly without hitting the RPC.
  * @param {string} contractId  Strkey-encoded contract address
  * @returns {Promise<{ name: string, symbol: string, decimals: number }>}
  */
 export async function fetchTokenMetadata(contractId) {
+  const cached = _metadataCache.get(contractId);
+  if (cached) return cached;
+
   const [name, symbol, decimals] = await Promise.all([
     simulateCall(contractId, "name"),
     simulateCall(contractId, "symbol"),
     simulateCall(contractId, "decimals"),
   ]);
 
-  return {
+  const meta = {
     name: String(name ?? ""),
     symbol: String(symbol ?? ""),
     decimals: Number(decimals ?? 7),
   };
+
+  _metadataCache.set(contractId, meta);
+  return meta;
+}
+
+/**
+ * Fetch only the decimals for a SEP-41 token contract.
+ * Uses the metadata cache so the RPC call is only made once per contract.
+ * @param {string} contractId  Strkey-encoded contract address
+ * @returns {Promise<number>}
+ */
+export async function fetchDecimals(contractId) {
+  const meta = await fetchTokenMetadata(contractId);
+  return meta.decimals;
+}
+
+/**
+ * Return the number of cached token metadata entries.
+ */
+export function cacheSize() {
+  return _metadataCache.size;
 }

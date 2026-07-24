@@ -6,6 +6,9 @@ import { decodeRwaEvent } from "./rwaDecoder.js";
 import { parseHeuristic } from "./heuristicParser.js";
 import { parseTTLHostFunction, formatTTLExtension } from "./ttlExtensionParser.js";
 import { parseZkHostFunctions, computeZkCostDelta } from "./zkHostFunctions.js";
+import { formatAmount } from "./formatAmount.js";
+import { fetchDecimals } from "./sep41Metadata.js";
+import { loadPlugins, runPlugins } from "./decoderPlugins.js";
 
 // Result codes that indicate the block compute budget was exhausted.
 const RESOURCE_LIMIT_CODES = new Set([
@@ -13,6 +16,15 @@ const RESOURCE_LIMIT_CODES = new Set([
   "txResourceLimitExceeded",
   "RESOURCE_LIMIT_EXCEEDED",
 ]);
+
+/**
+ * In-memory cache mapping contractId → decimals.
+ * Populated lazily on first encounter of each SEP-41 token contract
+ * via an on-chain `decimals()` call. The RPC call is only made once per
+ * contract across multiple events (satisfies #568 acceptance criteria).
+ * Falls back to 7 when the contract does not implement `decimals()`.
+ */
+const tokenDecimalsCache = new Map();
 
 /**
  * Returns true when the transaction was dropped because the block's total
@@ -103,14 +115,35 @@ const NATIVE_SAC_IDS = new Set([
 /**
  * Decode a raw Soroban RPC event into a human-readable record.
  * Uses the ABI template when available; falls back to a generic description.
+ *
+ * @param {object} ev  Raw Soroban RPC event
+ * @param {object} [opts]
+ * @param {boolean} [opts.currentAbi]  Use the latest ABI instead of versioned lookup
+ * @param {string}  [opts.failureReason]  Decoded failure reason from the transaction
  */
-export async function decode(ev, { currentAbi = false } = {}) {
+export async function decode(ev, { currentAbi = false, failureReason = null } = {}) {
   const contractId = ev.contractId;
   const topics = ev.topic.map((t) => scValToNative(t));
   const data = scValToNative(ev.value);
 
   // First topic is typically the function name symbol
   const fnName = typeof topics[0] === "symbol" || typeof topics[0] === "string" ? String(topics[0]) : "unknown";
+
+  // ── #567: run plugin decoders first (first match wins) ─────────────
+  const pluginResult = await runPlugins(ev, topics, data, contractId).catch(() => null);
+  if (pluginResult) {
+    return {
+      contract_id: contractId,
+      function: fnName,
+      ledger: ev.ledger,
+      tx_hash: ev.txHash,
+      description: pluginResult.description,
+      raw_topics: topics.map((t) => stripNul(t)),
+      raw_data: safeStringify(data),
+      ...extractGasCosts(ev),
+      ...(failureReason && { is_failed: true, failure_reason: failureReason }),
+    };
+  }
 
   // Detect native XLM wrap/unwrap on the SAC contract
   if (NATIVE_SAC_IDS.has(contractId)) {
@@ -125,6 +158,7 @@ export async function decode(ev, { currentAbi = false } = {}) {
         raw_topics: topics.map((t) => stripNul(t)),
         raw_data: safeStringify(data),
         ...extractGasCosts(ev),
+        ...(failureReason && { is_failed: true, failure_reason: failureReason }),
       };
     }
   }
@@ -149,6 +183,18 @@ export async function decode(ev, { currentAbi = false } = {}) {
       ? `${assetCode} (SAC:${contractId.slice(0, 8)}…)`
       : (meta?.name ?? contractId);
 
+  // ── #568: fetch decimals for this token contract (cached via sep41Metadata) ──
+  let decimals = 7;
+  if (!NATIVE_SAC_IDS.has(contractId)) {
+    try {
+      decimals = await fetchDecimals(contractId);
+      tokenDecimalsCache.set(contractId, decimals);
+    } catch {
+      // Fall back to default 7 if the contract doesn't implement decimals()
+      tokenDecimalsCache.set(contractId, 7);
+    }
+  }
+
   // Try RWA decoder first
   let description = null;
   if (meta) {
@@ -162,12 +208,17 @@ export async function decode(ev, { currentAbi = false } = {}) {
   }
 
   // Fall back to standard decoders
+  let isDecoded = Boolean(meta || vaultMeta || fnAbi);
   if (!description) {
-    description = vaultMeta
-      ? vaultDescription(fnName, topics.slice(1), data, contractLabel, vaultMeta)
-      : fnAbi
-        ? buildDescription(fnName, topics.slice(1), data, contractLabel)
-        : genericDescription(fnName, topics.slice(1), data, contractLabel);
+    if (vaultMeta) {
+      description = vaultDescription(fnName, topics.slice(1), data, contractLabel, vaultMeta);
+    } else if (fnAbi) {
+      description = buildDescription(fnName, topics.slice(1), data, contractLabel, decimals);
+    } else {
+      // #565: XDR pretty-printer fallback for unrecognised event types
+      description = xdrFallbackDescription(fnName, topics.slice(1), data, contractLabel);
+      isDecoded = false;
+    }
   }
 
   // Attach heuristic params when no ABI was available
@@ -187,6 +238,8 @@ export async function decode(ev, { currentAbi = false } = {}) {
     is_resource_limit_exceeded: isResourceLimitExceeded(ev),
     ...extractGasCosts(ev),
     ...(heuristicParams && { heuristic_params: heuristicParams }),
+    ...(failureReason && { is_failed: true, failure_reason: failureReason }),
+    ...(!isDecoded && { decoded: false }),
   };
 
   // Protocol 26: detect TTL extension host function calls on this event
@@ -271,28 +324,34 @@ function vaultDescription(fn, args, data, contractName, vaultMeta) {
  * SEP-41 transfer format:
  *   "Address {short-from} transferred {amount} {token} to {short-to} on {contractName}"
  * where short addresses are truncated to "AAAAAA…ZZZZ" (6 + 4 chars).
+ *
+ * @param {string} fn          Function name
+ * @param {any[]} args         Decoded function arguments
+ * @param {any}    data        Raw decoded data
+ * @param {string} contractName Display label for the contract
+ * @param {number} [decimals=7] Token decimal places for amount formatting (#568)
  */
-export function buildDescription(fn, args, data, contractName) {
+export function buildDescription(fn, args, data, contractName, decimals = 7) {
   switch (fn) {
     case "swap": {
       const [from, amtIn, tokenIn, amtOut, tokenOut] = args;
-      return `Address ${fmt(from)} swapped ${amtIn} ${tokenIn} → ${amtOut} ${tokenOut} on ${contractName}`;
+      return `Address ${fmt(from)} swapped ${fmtTokenAmount(amtIn, decimals)} ${tokenIn} → ${fmtTokenAmount(amtOut, decimals)} ${tokenOut} on ${contractName}`;
     }
     case "transfer": {
       const [from, to, amount, token] = args;
-      return `Address ${fmt(from)} transferred ${amount} ${token ?? ""} to ${fmt(to)} on ${contractName}`;
+      return `Address ${fmt(from)} transferred ${fmtTokenAmount(amount, decimals)} ${token ?? ""} to ${fmt(to)} on ${contractName}`;
     }
     case "mint": {
       const [to, amount, token] = args;
-      return `${amount} ${token ?? ""} minted to ${fmt(to)} on ${contractName}`;
+      return `${fmtTokenAmount(amount, decimals)} ${token ?? ""} minted to ${fmt(to)} on ${contractName}`;
     }
     case "burn": {
       const [from, amount, token] = args;
-      return `${amount} ${token ?? ""} burned from ${fmt(from)} on ${contractName}`;
+      return `${fmtTokenAmount(amount, decimals)} ${token ?? ""} burned from ${fmt(from)} on ${contractName}`;
     }
     case "clawback": {
       const [admin, from, amount, token] = args;
-      return `CLAWBACK: ${amount} ${token ?? ""} recovered from ${fmt(from)} by authority ${fmt(admin)} on ${contractName}`;
+      return `CLAWBACK: ${fmtTokenAmount(amount, decimals)} ${token ?? ""} recovered from ${fmt(from)} by authority ${fmt(admin)} on ${contractName}`;
     }
     default:
       return genericDescription(fn, args, data, contractName);
@@ -302,6 +361,21 @@ export function buildDescription(fn, args, data, contractName) {
 function genericDescription(fn, args, data, contractId) {
   const argStr = args.map(String).join(", ");
   return `${fn}(${argStr}) called on ${contractId}`;
+}
+
+/**
+ * #565: Build an XDR pretty-printer fallback description for events where
+ * no built-in or ABI-based decoder matched. Uses the already-decoded
+ * scValToNative output to produce a human-readable string.
+ *
+ * Format: "Unknown function: fn_name({param1: "value1", param2: 42})"
+ */
+function xdrFallbackDescription(fnName, topics, data, contractId) {
+  const params = {};
+  topics.forEach((t, i) => { params[`topic${i}`] = t; });
+  if (data != null) params.data = data;
+  const paramStr = JSON.stringify(params, (_, v) => typeof v === "bigint" ? v.toString() : v);
+  return `Unknown function: ${fnName}(${paramStr}) called on ${contractId}`;
 }
 
 function fmt(addr) {
@@ -314,4 +388,13 @@ function fmtXlm(amount) {
   // SAC amounts are in stroops (1 XLM = 10_000_000 stroops)
   const n = Number(amount);
   return isNaN(n) ? String(amount) : (n / 1e7).toLocaleString(undefined, { maximumFractionDigits: 7 });
+}
+
+/**
+ * Format a token amount using its on-chain decimal places.
+ * Uses BigInt-safe integer arithmetic via formatAmount() (#568).
+ */
+function fmtTokenAmount(amount, decimals = 7) {
+  if (amount == null) return "?";
+  return formatAmount(amount, decimals);
 }

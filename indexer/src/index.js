@@ -114,7 +114,7 @@ async function indexWasmUploads(txHashes, ledger) {
  *
  * @param {string | null | undefined} txHash
  * @param {object} adapters optional adapters for deterministic callers/tests
- * @returns {Promise<{ feeBump: object | null, archivalInfo: object | null }>}
+ * @returns {Promise<{ feeBump: object | null, archivalInfo: object | null, failureReason: string | null }>}
  */
 export async function loadTransactionContext(
   txHash,
@@ -129,7 +129,7 @@ export async function loadTransactionContext(
     },
   } = {},
 ) {
-  const context = { feeBump: null, archivalInfo: null };
+  const context = { feeBump: null, archivalInfo: null, failureReason: null };
   if (!txHash) return context;
 
   try {
@@ -140,6 +140,15 @@ export async function loadTransactionContext(
       if (restore.isRestoreOp) context.archivalInfo = restore;
     }
 
+    // #566: Extract failure reason for failed transactions
+    if (txResult?.status === "FAILED") {
+      try {
+        context.failureReason = await extractFailure(txResult);
+      } catch {
+        /* non-fatal */
+      }
+    }
+
     try {
       const status =
         txResult?.status === "SUCCESS" ? "success" : txResult?.status === "FAILED" ? "failed" : "pending";
@@ -147,7 +156,7 @@ export async function loadTransactionContext(
         tx_hash: txHash,
         status,
         ledger: txResult?.ledger ?? null,
-        error: await extractFailure(txResult),
+        error: context.failureReason,
       });
     } catch {
       /* non-fatal transaction-status enrichment */
@@ -171,9 +180,9 @@ export async function loadTransactionContext(
  * @returns {Promise<object>} the decoded event that was persisted
  */
 export async function processSingleEvent(rawSorobanEvent, context = undefined) {
-  const { feeBump, archivalInfo } = context ?? (await loadTransactionContext(rawSorobanEvent.txHash));
+  const { feeBump, archivalInfo, failureReason } = context ?? (await loadTransactionContext(rawSorobanEvent.txHash));
   const decodeStart = Date.now();
-  const decoded = await decode(rawSorobanEvent);
+  const decoded = await decode(rawSorobanEvent, { failureReason });
   const contractMeta = await db.getContractMeta(rawSorobanEvent.contractId).catch(() => null);
   decoded.abi_version = Number(contractMeta?.abi_version ?? 0);
   decodeLatency.observe(Date.now() - decodeStart);
@@ -195,6 +204,10 @@ export async function processSingleEvent(rawSorobanEvent, context = undefined) {
   decoded.storage_tiers = classifyStorageWrites(rawSorobanEvent);
   decoded.fee_bump = feeBump;
   decoded.archival_info = archivalInfo;
+  if (failureReason) {
+    decoded.is_failed = true;
+    decoded.failure_reason = failureReason;
+  }
   await db.upsertEventValidated(decoded);
 
   // Persist per-key state diffs for the timeline.
